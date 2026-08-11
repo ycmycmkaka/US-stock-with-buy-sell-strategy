@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Minervini 美股強勢股 + Entry Scanner</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <div>
+        <div class="eyebrow">每日自動更新</div>
+        <h1>美股強勢股 + 入場時機篩選器</h1>
+        <p class="subtitle">Market Cap + 流動性 + Minervini Trend Template + RS + Pivot / Breakout / Pullback / VCP</p>
+      </div>
+      <div id="summaryCard" class="summary-card">載入中…</div>
+    </header>
+
+    <section class="toolbar">
+      <input id="searchInput" type="search" placeholder="搜尋股票代號 / 公司名" />
+      <select id="statusFilter">
+        <option value="ALL">全部狀態</option>
+        <option value="READY">READY</option>
+        <option value="WATCH">WATCH</option>
+        <option value="WAIT">WAIT / Extended</option>
+      </select>
+      <select id="sortSelect">
+        <option value="entry_status">按 Entry Status</option>
+        <option value="dist_from_pivot">按最接近 Pivot</option>
+        <option value="rs_rating_desc">按 RS Rating ↓</option>
+        <option value="avg_dollar_volume_desc">按平均成交額 ↓</option>
+        <option value="rs_60d_vs_spy_pct_desc">按跑贏 SPY (60D) ↓</option>
+        <option value="symbol_asc">按代號 A→Z</option>
+      </select>
+    </section>
+
+    <section class="rules-card" id="rulesCard"></section>
+
+    <section class="legend-card">
+      <div><span class="status ready">READY</span> 今日已出現較明確 entry trigger，例如放量突破或回調後重新轉強。</div>
+      <div><span class="status watch">WATCH</span> 強勢但仍等 pivot / VCP / setup 完成。</div>
+      <div><span class="status wait">WAIT</span> 已經太離 pivot 或均線太遠，避免追高。</div>
+    </section>
+
+    <section class="table-card">
+      <div class="table-title-row">
+        <h2>符合強勢條件股票</h2>
+        <span id="countText"></span>
+      </div>
+      <div class="table-wrap">
+        <table id="results-table">
+          <thead>
+            <tr>
+              <th>代號</th>
+              <th>公司</th>
+              <th>Entry</th>
+              <th>Setup</th>
+              <th>最近收市</th>
+              <th>Pivot</th>
+              <th>距 Pivot</th>
+              <th>距 20MA</th>
+              <th>成交量 / 50D</th>
+              <th>20D 平均成交額</th>
+              <th>Contractions</th>
+              <th>RS</th>
+              <th>20D vs SPY</th>
+              <th>60D vs SPY</th>
+              <th>市值</th>
+            </tr>
+          </thead>
+          <tbody id="resultsBody"></tbody>
+        </table>
+      </div>
+      <div id="emptyState" class="empty hidden">暫時冇符合條件股票。</div>
+    </section>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
