@@ -1,0 +1,83 @@
+name: Update Stock Monitor
+
+on:
+  # 可以喺 Actions 頁面手動撳 Run workflow
+  workflow_dispatch:
+
+  # 每日自動更新
+  schedule:
+    # UTC 22:00
+    # 約美東 6:00 PM（夏令時間）
+    # 約美東 5:00 PM（冬令時間）
+    - cron: "0 22 * * 1-5"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. 安裝 Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 3. 安裝 requirements.txt 入面需要嘅套件
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 4. 執行股票篩選程式
+      - name: Run stock screener
+        run: |
+          python update_data.py
+
+      # 5. 顯示 results.json 基本資料，方便檢查
+      - name: Check generated results
+        run: |
+          echo "===== Generated files ====="
+          ls -lh
+          echo "===== results.json ====="
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path("results.json")
+
+          if not p.exists():
+              raise SystemExit("ERROR: results.json was not created.")
+
+          with p.open("r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          print("results.json successfully generated.")
+          print("File size:", p.stat().st_size, "bytes")
+
+          if isinstance(data, list):
+              print("Number of records:", len(data))
+          elif isinstance(data, dict):
+              print("Top-level keys:", list(data.keys()))
+          PY
+
+      # 6. 將新 results.json commit 回 repository
+      - name: Commit updated data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add results.json
+
+          if git diff --cached --quiet; then
+            echo "No data changes to commit."
+          else
+            git commit -m "Auto update stock screening results"
+            git push
+          fi
