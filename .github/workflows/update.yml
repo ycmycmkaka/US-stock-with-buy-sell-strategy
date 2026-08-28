@@ -4,12 +4,12 @@ on:
   # 可以喺 Actions 頁面手動撳 Run workflow
   workflow_dispatch:
 
-  # 每日自動更新
+  # 星期一至五，美東時間 5:23 PM 自動更新
+  # America/New_York 會自動處理 EST / EDT 夏令時間
+  # 特登避開 :00 嘅 GitHub Actions 排程高峰
   schedule:
-    # UTC 22:00
-    # 約美東 6:00 PM（夏令時間）
-    # 約美東 5:00 PM（冬令時間）
-    - cron: "0 22 * * 1-5"
+    - cron: "23 17 * * 1-5"
+      timezone: "America/New_York"
 
 permissions:
   contents: write
@@ -46,6 +46,7 @@ jobs:
           echo "===== Generated files ====="
           ls -lh
           echo "===== results.json ====="
+
           python - <<'PY'
           import json
           from pathlib import Path
