@@ -188,7 +188,12 @@ def history_problem(frame, target, sessions):
         return "inconsistent OHLC"
     expected = sessions[sessions >= frame["date"].iloc[0]]
     if list(frame["date"]) != list(expected):
-        return "missing or unexpected trading sessions"
+        actual = pd.DatetimeIndex(frame["date"])
+        missing = expected.difference(actual).strftime("%Y-%m-%d").tolist()
+        unexpected = actual.difference(expected).strftime("%Y-%m-%d").tolist()
+        return ("missing or unexpected trading sessions: "
+                f"missing={missing[:10]} ({len(missing)} total); "
+                f"unexpected={unexpected[:10]} ({len(unexpected)} total)")
     return None
 
 
@@ -235,13 +240,36 @@ def fetch_histories(symbols, config, target_session=None):
         print("Unresolved history: " + "; ".join(f"{s}: {problems[s]}" for s in pending[:20]))
         if attempt < attempts:
             time.sleep(retry_delay * attempt)
+    # A current, otherwise valid stock with historical gaps cannot be screened,
+    # but a small isolated gap must not block every healthy stock. Never exempt
+    # stale/missing/invalid bars or the benchmark. Never fill missing prices.
+    benchmark_symbol = str(config.get("benchmark_symbol", "SPY")).upper()
+    excluded = {
+        symbol: problems[symbol] for symbol in pending
+        if symbol != benchmark_symbol
+        and problems[symbol].startswith("missing or unexpected trading sessions:")
+    }
+    stock_count = len(set(symbols) - {benchmark_symbol})
+    exclusion_limit = math.floor(stock_count * 0.01)
+    if len(excluded) > exclusion_limit:
+        raise RuntimeError(
+            f"Historical gaps affect {len(excluded)}/{stock_count} stocks "
+            f"(limit {exclusion_limit}, 1%); refusing to publish. "
+            + "; ".join(f"{s}: {reason}" for s, reason in excluded.items())
+        )
+    pending = [s for s in pending if s not in excluded]
     if pending:
         raise RuntimeError(
             f"{len(pending)} symbols failed freshness/completeness validation for {target.date()}: "
             + "; ".join(f"{s}: {problems[s]}" for s in pending)
             + ". Refusing to publish; previous results.json is unchanged."
         )
-    return pd.concat([accepted[s] for s in sorted(accepted)], ignore_index=True) if accepted else pd.DataFrame()
+    if excluded:
+        print("Excluded from screening after retries: " + "; ".join(
+            f"{s}: {reason}" for s, reason in excluded.items()))
+    result = pd.concat([accepted[s] for s in sorted(accepted)], ignore_index=True) if accepted else pd.DataFrame()
+    result.attrs["excluded_history_symbols"] = excluded
+    return result
 
 
 def pct_return_from_bars(closes: pd.Series, bars_back: int):
@@ -773,7 +801,9 @@ def build_results():
     output = {
         "data_as_of": target_session.strftime("%Y-%m-%d"),
         "benchmark_data_as_of": target_session.strftime("%Y-%m-%d"),
-        "data_validation": {"status": "passed", "validated_symbols": len(history_symbols),
+        "data_validation": {"status": "passed", "validated_symbols": int(history_df["symbol"].nunique()),
+                            "requested_symbols": len(history_symbols),
+                            "excluded_history_symbols": history_df.attrs.get("excluded_history_symbols", {}),
                             "run_id": os.environ.get("GITHUB_RUN_ID"),
                             "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT")},
         "generated_at": pd.Timestamp.now("UTC").strftime("%Y-%m-%d %H:%M UTC"),
