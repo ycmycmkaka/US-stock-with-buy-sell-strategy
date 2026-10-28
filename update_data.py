@@ -1,9 +1,12 @@
 import json
 import math
+import os
+import re
 import time
 from pathlib import Path
 
 import pandas as pd
+import pandas_market_calendars as mcal
 import requests
 from yahooquery import Ticker
 
@@ -106,37 +109,139 @@ def fetch_quote_metadata(symbols, config):
     return metadata
 
 
+def latest_completed_session(now=None):
+    """Use actual US exchange closes, including holidays, early closes and DST."""
+    now = pd.Timestamp.now("UTC") if now is None else pd.Timestamp(now)
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    now = now.tz_convert("UTC")
+    local_day = now.tz_convert("America/New_York").date()
+    schedule = mcal.get_calendar("NYSE").schedule(
+        start_date=pd.Timestamp(local_day) - pd.Timedelta(days=30),
+        end_date=local_day,
+    )
+    completed = schedule[schedule["market_close"] <= now]
+    if completed.empty:
+        raise RuntimeError("Cannot determine latest completed US trading session")
+    return pd.Timestamp(completed.index[-1]).normalize().tz_localize(None)
+
+
+def session_date(value):
+    # Yahoo daily date objects are session labels, not UTC instants. Only
+    # timezone-aware timestamps need converting to the exchange timezone.
+    try:
+        ts = pd.Timestamp(value)
+        if pd.isna(ts):
+            return pd.NaT
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert("America/New_York").tz_localize(None)
+        return ts.normalize()
+    except (TypeError, ValueError):
+        return pd.NaT
+
+
 def normalize_history(history):
-    if history is None or not hasattr(history, "reset_index"):
+    if not isinstance(history, pd.DataFrame):
         return pd.DataFrame()
     df = history.reset_index()
-    if df.empty or "symbol" not in df.columns or "date" not in df.columns:
+    required = ["symbol", "date", "open", "high", "low", "close", "volume"]
+    if df.empty or not set(required).issubset(df.columns):
         return pd.DataFrame()
-    df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce").dt.tz_convert(None)
-    df = df.dropna(subset=["date"])
-    return df.sort_values(["symbol", "date"])
+    df["date"] = df["date"].map(session_date)
+    df = df.dropna(subset=["symbol", "date"])
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return (df.sort_values(["symbol", "date"])
+            .drop_duplicates(["symbol", "date"], keep="last"))
 
 
-def fetch_histories(symbols, config):
-    period = config.get("history_period", "15mo")
-    batch_size = int(config.get("batch_size_history", 60))
-    frames = []
+def history_start(period, target):
+    """Translate the configured lookback (including 15mo) to explicit dates."""
+    period = str(period).lower()
+    if period == "max":
+        return pd.Timestamp("1970-01-01")
+    if period == "ytd":
+        return pd.Timestamp(year=target.year, month=1, day=1)
+    match = re.fullmatch(r"([1-9][0-9]*)(d|wk|mo|y)", period)
+    if not match:
+        raise ValueError(f"Unsupported history_period: {period}")
+    amount, unit = match.groups()
+    key = {"d": "days", "wk": "weeks", "mo": "months", "y": "years"}[unit]
+    return target - pd.DateOffset(**{key: int(amount)})
 
-    for start in range(0, len(symbols), batch_size):
-        batch = symbols[start : start + batch_size]
-        try:
-            t = Ticker(batch, asynchronous=True, max_workers=8)
-            hist = t.history(period=period, interval="1d")
-            df = normalize_history(hist)
-            if not df.empty:
-                frames.append(df)
-        except Exception as exc:
-            print(f"History batch failed {start}-{start + len(batch)}: {exc}")
-            time.sleep(1)
-            continue
-        time.sleep(0.1)
 
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+def history_problem(frame, target, sessions):
+    if frame.empty:
+        return "missing history"
+    if frame["date"].iloc[-1] != target:
+        return f"latest daily bar is {frame['date'].iloc[-1].date()}, expected {target.date()}"
+    # Every bar used by the unchanged calculations must be a valid daily bar.
+    numeric = frame[["open", "high", "low", "close", "volume"]]
+    if not numeric.map(lambda x: pd.notna(x) and math.isfinite(x)).all().all():
+        return "missing or non-finite OHLCV"
+    if (frame[["open", "high", "low", "close"]] <= 0).any().any():
+        return "non-positive price"
+    if (frame["volume"] < 0).any():
+        return "negative volume"
+    if ((frame["high"] < frame[["open", "close", "low"]].max(axis=1)) |
+            (frame["low"] > frame[["open", "close", "high"]].min(axis=1))).any():
+        return "inconsistent OHLC"
+    expected = sessions[sessions >= frame["date"].iloc[0]]
+    if list(frame["date"]) != list(expected):
+        return "missing or unexpected trading sessions"
+    return None
+
+
+def fetch_histories(symbols, config, target_session=None):
+    target = latest_completed_session() if target_session is None else pd.Timestamp(target_session)
+    start_date = history_start(config.get("history_period", "15mo"), target)
+    # Yahoo's end boundary is exclusive. Never include a later intraday bar.
+    end_date = target + pd.Timedelta(days=1)
+    sessions = mcal.get_calendar("NYSE").schedule(
+        start_date=start_date, end_date=target).index.tz_localize(None)
+    batch_size = max(1, int(config.get("batch_size_history", 60)))
+    attempts = max(1, int(config.get("history_max_attempts", 4)))
+    retry_delay = max(0.0, float(config.get("history_retry_delay_seconds", 60)))
+    pending = sorted(set(symbols))
+    accepted, problems = {}, {}
+
+    for attempt in range(1, attempts + 1):
+        print(f"History attempt {attempt}/{attempts}: {len(pending)} symbols; session {target.date()}")
+        for start in range(0, len(pending), batch_size):
+            batch = pending[start:start + batch_size]
+            try:
+                ticker = Ticker(batch, asynchronous=True, max_workers=8, timeout=30)
+                hist = ticker.history(start=start_date.strftime("%Y-%m-%d"),
+                                      end=end_date.strftime("%Y-%m-%d"),
+                                      interval="1d", adj_timezone=True)
+                df = normalize_history(hist)
+                if not df.empty:
+                    df = df[(df["date"] >= start_date) & (df["date"] <= target)]
+                for symbol in batch:
+                    frame = df[df["symbol"] == symbol].copy() if not df.empty else pd.DataFrame()
+                    problem = history_problem(frame, target, sessions)
+                    if problem:
+                        problems[symbol] = problem
+                    else:
+                        accepted[symbol] = frame
+                        problems.pop(symbol, None)
+            except Exception as exc:
+                for symbol in batch:
+                    problems[symbol] = f"download/validation error: {exc}"
+            time.sleep(0.1)
+        pending = [s for s in pending if s not in accepted]
+        if not pending:
+            break
+        print("Unresolved history: " + "; ".join(f"{s}: {problems[s]}" for s in pending[:20]))
+        if attempt < attempts:
+            time.sleep(retry_delay * attempt)
+    if pending:
+        raise RuntimeError(
+            f"{len(pending)} symbols failed freshness/completeness validation for {target.date()}: "
+            + "; ".join(f"{s}: {problems[s]}" for s in pending)
+            + ". Refusing to publish; previous results.json is unchanged."
+        )
+    return pd.concat([accepted[s] for s in sorted(accepted)], ignore_index=True) if accepted else pd.DataFrame()
 
 
 def pct_return_from_bars(closes: pd.Series, bars_back: int):
@@ -547,6 +652,8 @@ def round_or_none(value, digits=1):
 
 def build_results():
     config = load_config()
+    target_session = latest_completed_session()
+    print(f"Required completed trading session: {target_session.date()}")
     benchmark_symbol = str(config.get("benchmark_symbol", "SPY")).upper()
 
     symbols_df = fetch_us_symbols()
@@ -558,7 +665,7 @@ def build_results():
     print(f"Market-cap eligible: {len(large_cap_symbols)}")
 
     history_symbols = sorted(set(large_cap_symbols + [benchmark_symbol]))
-    history_df = fetch_histories(history_symbols, config)
+    history_df = fetch_histories(history_symbols, config, target_session)
     if history_df.empty:
         raise RuntimeError("No history data returned; keeping previous results.json")
 
@@ -624,6 +731,7 @@ def build_results():
     rows = []
     for _, row in final_df.iterrows():
         rows.append({
+            "data_as_of": target_session.strftime("%Y-%m-%d"),
             "symbol": row["symbol"],
             "company": row["company"],
             "exchange": row["exchange"],
@@ -663,6 +771,11 @@ def build_results():
         })
 
     output = {
+        "data_as_of": target_session.strftime("%Y-%m-%d"),
+        "benchmark_data_as_of": target_session.strftime("%Y-%m-%d"),
+        "data_validation": {"status": "passed", "validated_symbols": len(history_symbols),
+                            "run_id": os.environ.get("GITHUB_RUN_ID"),
+                            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT")},
         "generated_at": pd.Timestamp.now("UTC").strftime("%Y-%m-%d %H:%M UTC"),
         "method": "Minervini trend + custom RS + liquidity + entry setup scanner",
         "rules": {
@@ -695,6 +808,9 @@ def build_results():
         },
         "results": rows,
     }
+
+    if latest_completed_session() != target_session:
+        raise RuntimeError("A newer session closed during this run; rerun before publishing")
 
     tmp_path = RESULTS_PATH.with_suffix(".json.tmp")
     with open(tmp_path, "w", encoding="utf-8") as f:
