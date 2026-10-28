@@ -1,81 +1,68 @@
 name: Update Stock Monitor
 
 on:
-  # 可以喺 Actions 頁面手動撳 Run workflow
   workflow_dispatch:
-
-  # 星期一至五，美東時間 5:23 PM 自動更新
-  # America/New_York 會自動處理 EST / EDT 夏令時間
-  # 特登避開 :00 嘅 GitHub Actions 排程高峰
   schedule:
-    - cron: "23 17 * * 1-5"
-      timezone: "America/New_York"
+    # 22:23 UTC = 18:23 EDT / 17:23 EST; after the US regular close.
+    # Hong Kong: 06:23 Tuesday-Saturday. Trading holidays are handled in Python.
+    - cron: "23 22 * * 1-5"
 
 permissions:
   contents: write
 
+concurrency:
+  group: stock-monitor-update-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   update:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 60
     steps:
-      # 1. Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. 安裝 Python
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # 3. 安裝 requirements.txt 入面需要嘅套件
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install -r requirements.txt "pandas-market-calendars>=5.1,<6"
 
-      # 4. 執行股票篩選程式
-      - name: Run stock screener
+      - name: Run stock screener with strict daily-data validation
+        run: python -u update_data.py
+
+      # Default success() means these steps cannot publish after scanner failure.
+      - name: Validate this run and commit fresh results
+        env:
+          TZ: UTC
         run: |
-          python update_data.py
-
-      # 5. 顯示 results.json 基本資料，方便檢查
-      - name: Check generated results
-        run: |
-          echo "===== Generated files ====="
-          ls -lh
-          echo "===== results.json ====="
-
           python - <<'PY'
           import json
+          import os
           from pathlib import Path
+          from update_data import latest_completed_session
 
-          p = Path("results.json")
-
-          if not p.exists():
-              raise SystemExit("ERROR: results.json was not created.")
-
-          with p.open("r", encoding="utf-8") as f:
-              data = json.load(f)
-
-          print("results.json successfully generated.")
-          print("File size:", p.stat().st_size, "bytes")
-
-          if isinstance(data, list):
-              print("Number of records:", len(data))
-          elif isinstance(data, dict):
-              print("Top-level keys:", list(data.keys()))
+          data = json.loads(Path("results.json").read_text(encoding="utf-8"))
+          expected = latest_completed_session().strftime("%Y-%m-%d")
+          validation = data.get("data_validation", {})
+          if (validation.get("status") != "passed"
+                  or validation.get("run_id") != os.environ["GITHUB_RUN_ID"]
+                  or validation.get("run_attempt") != os.environ["GITHUB_RUN_ATTEMPT"]):
+              raise SystemExit("ERROR: results were not validated by this run.")
+          if data.get("data_as_of") != expected or data.get("benchmark_data_as_of") != expected:
+              raise SystemExit(f"ERROR: stock/SPY data must be dated {expected}.")
+          if any(row.get("data_as_of") != expected for row in data["results"]):
+              raise SystemExit("ERROR: mismatched stock signal date.")
+          print(f"Validated session {expected}; {len(data['results'])} matches.")
           PY
 
-      # 6. 將新 results.json commit 回 repository
-      - name: Commit updated data
-        run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add results.json
-
           if git diff --cached --quiet; then
             echo "No data changes to commit."
           else
